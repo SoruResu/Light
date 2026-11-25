@@ -343,6 +343,27 @@ class ModeraminaLucisApp:
             self.hotkey_entry.delete(0, tk.END)
             self.hotkey_entry.insert(0, "+".join(parts))
         return "break"
+
+    def draw_color_curve(self, curves):
+        c = self.curve_canvas
+        c.delete("all")
+        w, h, pad_x, pad_y = 390, 135, 10, 10
+        plot_w, plot_h = w - 2 * pad_x, h - 2 * pad_y
+
+        for frac in (0.25, 0.5, 0.75):
+            gx = pad_x + frac * plot_w
+            gy = pad_y + frac * plot_h
+            c.create_line(gx, pad_y, gx, h - pad_y, fill="#1B222C", width=1)
+            c.create_line(pad_x, gy, w - pad_x, gy, fill="#1B222C", width=1)
+
+        c.create_line(pad_x, h - pad_y, w - pad_x, pad_y, fill="#30363D", dash=(4, 4), width=1)
+
+        for ch_idx, color in enumerate((COLOR_RED, COLOR_GREEN, COLOR_BLUE)):
+            pts = []
+            for i in range(0, 256, 8):
+                pts.extend((pad_x + (i / 255.0) * plot_w, (h - pad_y) - curves[ch_idx][i] * plot_h))
+            pts.extend((pad_x + plot_w, (h - pad_y) - curves[ch_idx] * plot_h))
+            c.create_line(*pts, fill=color, width=2)
     def update_display(self, _=None):
         g, br, ct = self.gamma_var.get(), self.bright_var.get(), self.contrast_var.get()
         r, gr, b = self.r_var.get(), self.g_var.get(), self.b_var.get()
@@ -539,24 +560,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = ModeraminaLucisApp(root)
     root.mainloop()
-
-    def draw_color_curve(self, curves):
-        c = self.curve_canvas
-        c.delete("all")
-        w, h, pad_x, pad_y = 390, 135, 10, 10
-        plot_w, plot_h = w - 2 * pad_x, h - 2 * pad_y
-
-        for frac in (0.25, 0.5, 0.75):
-            gx = pad_x + frac * plot_w
-            gy = pad_y + frac * plot_h
-            c.create_line(gx, pad_y, gx, h - pad_y, fill="#1B222C", width=1)
-            c.create_line(pad_x, gy, w - pad_x, gy, fill="#1B222C", width=1)
-
-        c.create_line(pad_x, h - pad_y, w - pad_x, pad_y, fill="#30363D", dash=(4, 4), width=1)
-
-        for ch_idx, color in enumerate((COLOR_RED, COLOR_GREEN, COLOR_BLUE)):
-            pts = []
-            for i in range(0, 256, 8):
-                pts.extend((pad_x + (i / 255.0) * plot_w, (h - pad_y) - curves[ch_idx][i] * plot_h))
-            pts.extend((pad_x + plot_w, (h - pad_y) - curves[ch_idx] * plot_h))
-            c.create_line(*pts, fill=color, width=2)
