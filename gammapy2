@@ -1,0 +1,562 @@
+import glob
+import json
+import math
+import os
+import select
+import subprocess
+import threading
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+try:
+    import evdev
+    from evdev import ecodes
+    HAS_EVDEV = True
+except ImportError:
+    HAS_EVDEV = False
+
+PROFILES_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "moderamina_profiles.json"
+)
+
+BG_DARK = "#0D1117"
+BG_CARD = "#161B22"
+BG_INPUT = "#21262D"
+BORDER_SUBTLE = "#30363D"
+TEXT_PRIMARY = "#F0F6FC"
+TEXT_MUTED = "#8B949E"
+ACCENT_GOLD = "#FFD166"
+ACCENT_CYAN = "#00F5D4"
+COLOR_RED = "#FF6B6B"
+COLOR_GREEN = "#51CF66"
+COLOR_BLUE = "#4DABF7"
+
+KEY_MAP = {
+    **{chr(c): getattr(ecodes, f"KEY_{chr(c)}") for c in range(ord("A"), ord("Z") + 1) if HAS_EVDEV},
+    **{str(d): getattr(ecodes, f"KEY_{d}") for d in range(10) if HAS_EVDEV},
+    **{f"F{i}": getattr(ecodes, f"KEY_F{i}") for i in range(1, 13) if HAS_EVDEV},
+    **{f"NUM{d}": getattr(ecodes, f"KEY_KP{d}") for d in range(10) if HAS_EVDEV},
+}
+
+
+def parse_hotkey(hotkey_str):
+    if not hotkey_str or not hotkey_str.strip() or not HAS_EVDEV:
+        return None
+    parts = [p.strip().upper() for p in hotkey_str.split("+") if p.strip()]
+    if len(parts) < 2:
+        return None
+
+    mods = set()
+    for part in parts[:-1]:
+        if part in ("CTRL", "CONTROL"):
+            mods.add("CTRL")
+        elif part == "ALT":
+            mods.add("ALT")
+        elif part == "SHIFT":
+            mods.add("SHIFT")
+        else:
+            return None
+
+    key_part = parts[-1]
+    if key_part not in KEY_MAP or not mods:
+        return None
+    return mods, KEY_MAP[key_part]
+
+
+def compute_lut_curves(gamma, brightness, contrast, r_mult, g_mult, b_mult):
+    curves = []
+    for mult in (r_mult, g_mult, b_mult):
+        ch_vals = []
+        for i in range(256):
+            val = i / 255.0
+            val = (val - 0.5) * contrast + 0.5 + brightness
+            val = max(0.0, min(1.0, val))
+            val = pow(val, 1.0 / gamma) * mult
+            val = max(0.0, min(1.0, val))
+            ch_vals.append(val)
+        curves.append(ch_vals)
+    return curves
+
+
+def set_gamma_ramp(gamma=1.0, brightness=0.0, contrast=1.0, r_mult=1.0, g_mult=1.0, b_mult=1.0):
+    curves = compute_lut_curves(gamma, brightness, contrast, r_mult, g_mult, b_mult)
+
+    eff_r = max(0.1, min(5.0, gamma * r_mult * contrast))
+    eff_g = max(0.1, min(5.0, gamma * g_mult * contrast))
+    eff_b = max(0.1, min(5.0, gamma * b_mult * contrast))
+    eff_bright = max(0.1, min(1.0, 1.0 + brightness))
+
+    try:
+        subprocess.run(
+            [
+                "gammastep", "-P", "-O", "6500",
+                "-g", f"{eff_r:.2f}:{eff_g:.2f}:{eff_b:.2f}",
+                "-b", f"{eff_bright:.2f}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.5,
+        )
+        return True, curves
+    except Exception:
+        return False, curves
+
+
+def create_moderamina_lucis_icon():
+    size = 36
+    img = tk.PhotoImage(width=size, height=size)
+    cx, cy = (size - 1) / 2.0, (size - 1) / 2.0
+
+    for y in range(size):
+        for x in range(size):
+            dx, dy = x - cx, y - cy
+            dist = math.hypot(dx, dy)
+            if dist <= 16.5:
+                if dist > 15.0:
+                    img.put("#30363D", (x, y))
+                elif dist <= 10.5:
+                    if (dx + dy) < 0:
+                        color = "#FFD166" if dist < 8.0 else "#F77F00"
+                    else:
+                        color = "#14213D"
+                    nx, ny = dx / 9.5, -dy / 9.5
+                    t = max(0.0, min(1.0, (nx + 1.0) / 2.0))
+                    if abs(ny - (2.0 * (t ** 2.2) - 1.0)) < 0.16:
+                        color = "#00F5D4"
+                    img.put(color, (x, y))
+                else:
+                    angle = math.atan2(dy, dx)
+                    ray_offset = abs(((angle + math.pi / 8) % (math.pi / 4)) - (math.pi / 8))
+                    if ray_offset < 0.11 and dist < 14.5:
+                        img.put("#F77F00" if (dx + dy) < 0 else "#4A5568", (x, y))
+                    else:
+                        img.put("#161B22", (x, y))
+    return img
+class ModeraminaLucisApp:
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Moderamina Lucis (Nobara Linux)")
+        self.root.geometry("450x740")
+        self.root.configure(bg=BG_DARK)
+        self.root.resizable(False, False)
+
+        self.icon_img = create_moderamina_lucis_icon()
+        self.root.iconphoto(True, self.icon_img)
+
+        self.gamma_var = tk.DoubleVar(value=1.0)
+        self.bright_var = tk.DoubleVar(value=0.0)
+        self.contrast_var = tk.DoubleVar(value=1.0)
+        self.r_var = tk.DoubleVar(value=1.0)
+        self.g_var = tk.DoubleVar(value=1.0)
+        self.b_var = tk.DoubleVar(value=1.0)
+
+        self.val_labels = {}
+        self.profiles = self.load_profiles()
+        self.hotkey_stop_event = threading.Event()
+        self.hotkey_thread = None
+
+        self.configure_styles()
+        self.build_ui()
+        self.refresh_profile_list()
+        self.update_display()
+        self.restart_hotkey_listener()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def configure_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(
+            "Dark.Horizontal.TScale",
+            background=BG_CARD,
+            troughcolor=BG_INPUT,
+            bordercolor=BORDER_SUBTLE,
+            lightcolor=ACCENT_GOLD,
+            darkcolor=ACCENT_GOLD,
+        )
+        style.configure(
+            "Dark.TCombobox",
+            fieldbackground=BG_INPUT,
+            background=BG_INPUT,
+            foreground=TEXT_PRIMARY,
+            arrowcolor=ACCENT_GOLD,
+            bordercolor=BORDER_SUBTLE,
+        )
+
+    def build_ui(self):
+        header = tk.Frame(self.root, bg=BG_DARK)
+        header.pack(fill="x", padx=18, pady=(14, 8))
+        tk.Label(header, image=self.icon_img, bg=BG_DARK).pack(side="left", padx=(0, 12))
+
+        title_box = tk.Frame(header, bg=BG_DARK)
+        title_box.pack(side="left")
+        tk.Label(
+            title_box, text="Moderamina Lucis", font=("Serif", 15, "bold"),
+            fg=ACCENT_GOLD, bg=BG_DARK,
+        ).pack(anchor="w")
+        tk.Label(
+            title_box, text="Regulators of Light • Real-Time LUT & Profile Engine",
+            font=("Sans", 8), fg=TEXT_MUTED, bg=BG_DARK,
+        ).pack(anchor="w")
+
+        curve_card = tk.Frame(
+            self.root, bg=BG_CARD, highlightbackground=BORDER_SUBTLE, highlightthickness=1
+        )
+        curve_card.pack(fill="x", padx=18, pady=(4, 10))
+
+        curve_hdr = tk.Frame(curve_card, bg=BG_CARD)
+        curve_hdr.pack(fill="x", padx=12, pady=(8, 4))
+        tk.Label(
+            curve_hdr, text="LUMINANCE & RGB RESPONSE CURVE",
+            font=("Sans", 8, "bold"), fg=TEXT_MUTED, bg=BG_CARD,
+        ).pack(side="left")
+        tk.Label(
+            curve_hdr, text="R • G • B",
+            font=("Sans", 8, "bold"), fg=ACCENT_CYAN, bg=BG_CARD,
+        ).pack(side="right")
+
+        self.curve_canvas = tk.Canvas(
+            curve_card, width=390, height=135, bg="#0A0E14", highlightthickness=0
+        )
+        self.curve_canvas.pack(padx=12, pady=(0, 10))
+
+        sliders_card = tk.Frame(
+            self.root, bg=BG_CARD, highlightbackground=BORDER_SUBTLE, highlightthickness=1
+        )
+        sliders_card.pack(fill="x", padx=18, pady=(0, 10))
+
+        slider_specs = [
+            ("gamma", "Master Gamma", 0.40, 2.80, self.gamma_var, ACCENT_GOLD),
+            ("bright", "Brightness", -0.50, 0.50, self.bright_var, TEXT_PRIMARY),
+            ("contrast", "Contrast", 0.50, 2.00, self.contrast_var, TEXT_PRIMARY),
+            ("r", "Red Channel", 0.20, 1.50, self.r_var, COLOR_RED),
+            ("g", "Green Channel", 0.20, 1.50, self.g_var, COLOR_GREEN),
+            ("b", "Blue Channel", 0.20, 1.50, self.b_var, COLOR_BLUE),
+        ]
+
+        for idx, (key, label, min_v, max_v, var, color) in enumerate(slider_specs):
+            row = tk.Frame(sliders_card, bg=BG_CARD)
+            row.pack(
+                fill="x", padx=12,
+                pady=(10 if idx == 0 else 4, 10 if idx == len(slider_specs) - 1 else 0),
+            )
+            lbl_row = tk.Frame(row, bg=BG_CARD)
+            lbl_row.pack(fill="x")
+            tk.Label(lbl_row, text=label, font=("Sans", 8, "bold"), fg=color, bg=BG_CARD).pack(side="left")
+
+            val_lbl = tk.Label(
+                lbl_row, text=f"{var.get():.2f}", font=("Monospace", 8, "bold"),
+                fg=TEXT_PRIMARY, bg=BG_CARD,
+            )
+            val_lbl.pack(side="right")
+            self.val_labels[key] = val_lbl
+
+            ttk.Scale(
+                row, from_=min_v, to=max_v, variable=var,
+                style="Dark.Horizontal.TScale", command=self.update_display,
+            ).pack(fill="x", pady=(1, 0))
+
+        prof_card = tk.Frame(
+            self.root, bg=BG_CARD, highlightbackground=BORDER_SUBTLE, highlightthickness=1
+        )
+        prof_card.pack(fill="x", padx=18, pady=(0, 10))
+
+        tk.Label(
+            prof_card, text="PROFILES & CUSTOM GLOBAL HOTKEYS",
+            font=("Sans", 8, "bold"), fg=ACCENT_GOLD, bg=BG_CARD,
+        ).pack(anchor="w", padx=12, pady=(8, 6))
+
+        sel_row = tk.Frame(prof_card, bg=BG_CARD)
+        sel_row.pack(fill="x", padx=12, pady=(0, 6))
+
+        self.profile_combo = ttk.Combobox(sel_row, state="readonly", style="Dark.TCombobox", width=26)
+        self.profile_combo.pack(side="left", padx=(0, 6))
+        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_selected)
+
+        self.make_btn(sel_row, "Apply", self.apply_selected_profile, ACCENT_CYAN, "#0D1117").pack(side="left", padx=(0, 4))
+        self.make_btn(sel_row, "Delete", self.delete_selected_profile, "#30363D", TEXT_PRIMARY).pack(side="left")
+
+        edit_row = tk.Frame(prof_card, bg=BG_CARD)
+        edit_row.pack(fill="x", padx=12, pady=(2, 8))
+
+        name_box = tk.Frame(edit_row, bg=BG_CARD)
+        name_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        tk.Label(name_box, text="Profile Name", font=("Sans", 7), fg=TEXT_MUTED, bg=BG_CARD).pack(anchor="w")
+        self.name_entry = tk.Entry(
+            name_box, bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+            relief="flat", font=("Sans", 9),
+        )
+        self.name_entry.pack(fill="x", ipady=3)
+
+        hk_box = tk.Frame(edit_row, bg=BG_CARD)
+        hk_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        tk.Label(
+            hk_box, text="Hotkey (Click & Press Keys)", font=("Sans", 7),
+            fg=TEXT_MUTED, bg=BG_CARD,
+        ).pack(anchor="w")
+        self.hotkey_entry = tk.Entry(
+            hk_box, bg=BG_INPUT, fg=ACCENT_GOLD, insertbackground=ACCENT_GOLD,
+            relief="flat", font=("Monospace", 9, "bold"),
+        )
+        self.hotkey_entry.pack(fill="x", ipady=3)
+        self.hotkey_entry.bind("<KeyPress>", self.capture_hotkey)
+
+        save_box = tk.Frame(edit_row, bg=BG_CARD)
+        save_box.pack(side="left")
+        tk.Label(save_box, text=" ", font=("Sans", 7), bg=BG_CARD).pack()
+        self.make_btn(save_box, "Save Current", self.save_current_as_profile, ACCENT_GOLD, "#0D1117").pack()
+
+        footer = tk.Frame(self.root, bg=BG_DARK)
+        footer.pack(fill="x", padx=18, pady=(2, 12))
+        self.status_lbl = tk.Label(footer, text="Ready", font=("Sans", 8), fg=TEXT_MUTED, bg=BG_DARK)
+        self.status_lbl.pack(side="left")
+        self.make_btn(footer, "Reset to Default", self.reset_values, "#21262D", TEXT_PRIMARY).pack(side="right")
+
+    def make_btn(self, parent, text, cmd, bg_color, fg_color):
+        return tk.Button(
+            parent, text=text, command=cmd, bg=bg_color, fg=fg_color,
+            activebackground=bg_color, activeforeground=fg_color,
+            relief="flat", font=("Sans", 8, "bold"), padx=10, pady=3, cursor="hand2",
+        )
+
+    def capture_hotkey(self, event):
+        if event.keysym in ("BackSpace", "Delete", "Escape"):
+            self.hotkey_entry.delete(0, tk.END)
+            return "break"
+        if event.keysym in ("Control_L", "Control_R", "Alt_L", "Alt_R", "Shift_L", "Shift_R", "Super_L", "Super_R"):
+            return "break"
+
+        parts = []
+        if event.state & 0x0004:
+            parts.append("Ctrl")
+        if event.state & 0x0008 or event.state & 0x0080:
+            parts.append("Alt")
+        if event.state & 0x0001:
+            parts.append("Shift")
+
+        key = event.keysym.upper()
+        if key.startswith("KP_"):
+            key = "NUM" + key[3:]
+
+        if parts and key in KEY_MAP:
+            parts.append(key)
+            self.hotkey_entry.delete(0, tk.END)
+            self.hotkey_entry.insert(0, "+".join(parts))
+        return "break"
+    def update_display(self, _=None):
+        g, br, ct = self.gamma_var.get(), self.bright_var.get(), self.contrast_var.get()
+        r, gr, b = self.r_var.get(), self.g_var.get(), self.b_var.get()
+
+        self.val_labels["gamma"].config(text=f"{g:.2f}")
+        self.val_labels["bright"].config(text=f"{br:+.2f}")
+        self.val_labels["contrast"].config(text=f"{ct:.2f}")
+        self.val_labels["r"].config(text=f"{r:.2f}")
+        self.val_labels["g"].config(text=f"{gr:.2f}")
+        self.val_labels["b"].config(text=f"{b:.2f}")
+
+        if getattr(self, "_render_job", None) is not None:
+            self.root.after_cancel(self._render_job)
+        self._render_job = self.root.after(40, self._apply_and_draw)
+
+    def _apply_and_draw(self):
+        self._render_job = None
+        ok, curves = set_gamma_ramp(
+            self.gamma_var.get(), self.bright_var.get(), self.contrast_var.get(),
+            self.r_var.get(), self.g_var.get(), self.b_var.get(),
+        )
+        self.draw_color_curve(curves)
+        if not ok:
+            self.status_lbl.config(text="Install 'gammastep' to apply display LUT", fg=COLOR_RED)
+
+    def apply_values(self, vals):
+        self.gamma_var.set(vals.get("gamma", 1.0))
+        self.bright_var.set(vals.get("brightness", 0.0))
+        self.contrast_var.set(vals.get("contrast", 1.0))
+        self.r_var.set(vals.get("r", 1.0))
+        self.g_var.set(vals.get("g", 1.0))
+        self.b_var.set(vals.get("b", 1.0))
+        self.update_display()
+
+    def reset_values(self):
+        self.apply_values({"gamma": 1.0, "brightness": 0.0, "contrast": 1.0, "r": 1.0, "g": 1.0, "b": 1.0})
+        self.status_lbl.config(text="Reset to default linear ramp", fg=TEXT_MUTED)
+
+    def load_profiles(self):
+        if os.path.exists(PROFILES_FILE):
+            try:
+                with open(PROFILES_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return [
+            {"name": "Default (Linear)", "hotkey": "Ctrl+Alt+0", "gamma": 1.0, "brightness": 0.0, "contrast": 1.0, "r": 1.0, "g": 1.0, "b": 1.0},
+            {"name": "Gaming Shadow Boost", "hotkey": "Ctrl+Alt+1", "gamma": 1.45, "brightness": 0.04, "contrast": 1.15, "r": 1.0, "g": 1.0, "b": 1.0},
+            {"name": "Nocturnal Warm", "hotkey": "Ctrl+Alt+2", "gamma": 0.95, "brightness": -0.04, "contrast": 1.0, "r": 1.0, "g": 0.84, "b": 0.62},
+        ]
+
+    def write_profiles(self):
+        with open(PROFILES_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.profiles, f, indent=2)
+
+    def refresh_profile_list(self):
+        items = [f"{p['name']}  [{p['hotkey']}]" if p.get("hotkey") else p["name"] for p in self.profiles]
+        self.profile_combo["values"] = items
+        if items:
+            self.profile_combo.current(0)
+
+    def on_profile_selected(self, _=None):
+        idx = self.profile_combo.current()
+        if 0 <= idx < len(self.profiles):
+            p = self.profiles[idx]
+            self.name_entry.delete(0, tk.END)
+            self.name_entry.insert(0, p["name"])
+            self.hotkey_entry.delete(0, tk.END)
+            self.hotkey_entry.insert(0, p.get("hotkey", ""))
+
+    def apply_selected_profile(self):
+        idx = self.profile_combo.current()
+        if 0 <= idx < len(self.profiles):
+            p = self.profiles[idx]
+            self.apply_values(p)
+            self.status_lbl.config(text=f"Active Profile: {p['name']}", fg=ACCENT_CYAN)
+
+    def save_current_as_profile(self):
+        name = self.name_entry.get().strip()
+        hk = self.hotkey_entry.get().strip()
+        if not name:
+            messagebox.showwarning("Missing Name", "Please enter a name for this profile.")
+            return
+        if hk and parse_hotkey(hk) is None:
+            messagebox.showwarning("Invalid Hotkey", "Use a modifier + key (e.g., Ctrl+Alt+3 or Shift+F5).")
+            return
+
+        new_entry = {
+            "name": name, "hotkey": hk,
+            "gamma": round(self.gamma_var.get(), 3),
+            "brightness": round(self.bright_var.get(), 3),
+            "contrast": round(self.contrast_var.get(), 3),
+            "r": round(self.r_var.get(), 3),
+            "g": round(self.g_var.get(), 3),
+            "b": round(self.b_var.get(), 3),
+        }
+
+        updated = False
+        for i, p in enumerate(self.profiles):
+            if p["name"].lower() == name.lower():
+                self.profiles[i] = new_entry
+                updated = True
+                break
+        if not updated:
+            self.profiles.append(new_entry)
+
+        self.write_profiles()
+        self.refresh_profile_list()
+        self.restart_hotkey_listener()
+        self.status_lbl.config(text=f"Saved profile: {name}", fg=ACCENT_GOLD)
+
+    def delete_selected_profile(self):
+        idx = self.profile_combo.current()
+        if 0 <= idx < len(self.profiles):
+            removed = self.profiles.pop(idx)
+            self.write_profiles()
+            self.refresh_profile_list()
+            self.restart_hotkey_listener()
+            self.status_lbl.config(text=f"Deleted: {removed['name']}", fg=TEXT_MUTED)
+
+    def restart_hotkey_listener(self):
+        self.hotkey_stop_event.set()
+        if self.hotkey_thread and self.hotkey_thread.is_alive():
+            self.hotkey_thread.join(timeout=0.5)
+
+        if not HAS_EVDEV:
+            self.status_lbl.config(text="Install python3-evdev for global hotkeys", fg=TEXT_MUTED)
+            return
+
+        self.hotkey_stop_event.clear()
+        parsed_profiles = []
+        for prof in self.profiles:
+            parsed = parse_hotkey(prof.get("hotkey", ""))
+            if parsed:
+                parsed_profiles.append((parsed, parsed, dict(prof)))
+
+        def listen():
+            devices = []
+            for path in glob.glob("/dev/input/event*"):
+                try:
+                    dev = evdev.InputDevice(path)
+                    if ecodes.EV_KEY in dev.capabilities():
+                        devices.append(dev)
+                except Exception:
+                    pass
+
+            if not devices:
+                self.root.after(0, lambda: self.status_lbl.config(
+                    text="Hotkeys disabled (add user to 'input' group)", fg=TEXT_MUTED
+                ))
+                return
+
+            self.root.after(0, lambda: self.status_lbl.config(text="Global Hotkeys Active", fg=TEXT_MUTED))
+            pressed_keys = set()
+
+            while not self.hotkey_stop_event.is_set():
+                r, _, _ = select.select(devices, [], [], 0.2)
+                for dev in r:
+                    try:
+                        for event in dev.read():
+                            if event.type == ecodes.EV_KEY:
+                                if event.value == 1:
+                                    pressed_keys.add(event.code)
+                                    active_mods = set()
+                                    if ecodes.KEY_LEFTCTRL in pressed_keys or ecodes.KEY_RIGHTCTRL in pressed_keys:
+                                        active_mods.add("CTRL")
+                                    if ecodes.KEY_LEFTALT in pressed_keys or ecodes.KEY_RIGHTALT in pressed_keys:
+                                        active_mods.add("ALT")
+                                    if ecodes.KEY_LEFTSHIFT in pressed_keys or ecodes.KEY_RIGHTSHIFT in pressed_keys:
+                                        active_mods.add("SHIFT")
+
+                                    for req_mods, req_key, prof in parsed_profiles:
+                                        if event.code == req_key and active_mods == req_mods:
+                                            self.root.after(0, lambda p=prof: self.trigger_hotkey_profile(p))
+                                elif event.value == 0:
+                                    pressed_keys.discard(event.code)
+                    except Exception:
+                        pass
+
+        self.hotkey_thread = threading.Thread(target=listen, daemon=True)
+        self.hotkey_thread.start()
+
+    def trigger_hotkey_profile(self, prof):
+        self.apply_values(prof)
+        self.status_lbl.config(text=f"Hotkey Triggered: {prof['name']} ({prof['hotkey']})", fg=ACCENT_GOLD)
+
+    def on_close(self):
+        self.hotkey_stop_event.set()
+        self.reset_values()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ModeraminaLucisApp(root)
+    root.mainloop()
+
+    def draw_color_curve(self, curves):
+        c = self.curve_canvas
+        c.delete("all")
+        w, h, pad_x, pad_y = 390, 135, 10, 10
+        plot_w, plot_h = w - 2 * pad_x, h - 2 * pad_y
+
+        for frac in (0.25, 0.5, 0.75):
+            gx = pad_x + frac * plot_w
+            gy = pad_y + frac * plot_h
+            c.create_line(gx, pad_y, gx, h - pad_y, fill="#1B222C", width=1)
+            c.create_line(pad_x, gy, w - pad_x, gy, fill="#1B222C", width=1)
+
+        c.create_line(pad_x, h - pad_y, w - pad_x, pad_y, fill="#30363D", dash=(4, 4), width=1)
+
+        for ch_idx, color in enumerate((COLOR_RED, COLOR_GREEN, COLOR_BLUE)):
+            pts = []
+            for i in range(0, 256, 8):
+                pts.extend((pad_x + (i / 255.0) * plot_w, (h - pad_y) - curves[ch_idx][i] * plot_h))
+            pts.extend((pad_x + plot_w, (h - pad_y) - curves[ch_idx] * plot_h))
+            c.create_line(*pts, fill=color, width=2)
